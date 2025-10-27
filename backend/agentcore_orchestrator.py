@@ -6,6 +6,7 @@ import logging
 import asyncio
 from typing import Dict, AsyncIterator, Optional
 from dotenv import load_dotenv
+from botocore.exceptions import ClientError
 
 # Configure logging for orchestrator
 logger = logging.getLogger(__name__)
@@ -249,53 +250,102 @@ class AgentCoreOrchestrator:
             }
 
             # Add retry logic with exponential backoff for throttling
-            max_retries = 3
-            base_delay = 1
+            max_retries = 5
+            base_delay = 2
             
             for attempt in range(max_retries):
                 try:
                     response = await runtime_client.invoke_agent(**invoke_params)
                     break
-                except Exception as e:
-                    if "throttlingException" in str(e) and attempt < max_retries - 1:
-                        delay = base_delay * (2 ** attempt)
-                        logger.warning(f"Throttling detected, retrying in {delay} seconds (attempt {attempt + 1}/{max_retries})")
+                except ClientError as e:
+                    error_code = e.response.get('Error', {}).get('Code', '')
+                    error_message = str(e)
+                    
+                    # Check for throttling-related errors
+                    is_throttle = (
+                        'ThrottlingException' in error_code or
+                        'Throttling' in error_code or
+                        'throttlingException' in error_message.lower() or
+                        error_code == 'TooManyRequestsException'
+                    )
+                    
+                    if is_throttle and attempt < max_retries - 1:
+                        # Exponential backoff with jitter
+                        delay = base_delay * (2 ** attempt) + (attempt * 0.1)
+                        logger.warning(
+                            f"Throttling detected (attempt {attempt + 1}/{max_retries}), "
+                            f"retrying in {delay:.2f} seconds. Error: {error_code}"
+                        )
                         await asyncio.sleep(delay)
                         continue
                     else:
+                        logger.error(f"Non-retryable error: {error_code} - {error_message}")
+                        raise
+                except Exception as e:
+                    # For non-ClientError exceptions, check message content
+                    if 'throttling' in str(e).lower() and attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning(
+                            f"Throttling detected in generic exception (attempt {attempt + 1}/{max_retries}), "
+                            f"retrying in {delay:.2f} seconds"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Unexpected error: {e}")
                         raise
 
             chunk_count = 0
             trace_count = 0
 
             # ASYNC iteration - no blocking!
-            async for event in response["completion"]:
-                if "chunk" in event:
-                    text = event["chunk"]["bytes"].decode("utf-8")
-                    chunk_count += 1
-                    yield {"type": "chunk", "text": text, "session_id": session_id}
+            try:
+                async for event in response["completion"]:
+                    if "chunk" in event:
+                        text = event["chunk"]["bytes"].decode("utf-8")
+                        chunk_count += 1
+                        yield {"type": "chunk", "text": text, "session_id": session_id}
 
-                elif "trace" in event:
-                    trace_count += 1
-                    trace_data = self._parse_trace_event(event, session_id)
-                    logger.info(
-                        f"AgentCore TRACE #{trace_count}: Full trace data: {trace_data}"
-                    )
+                    elif "trace" in event:
+                        trace_count += 1
+                        trace_data = self._parse_trace_event(event, session_id)
+                        logger.info(
+                            f"AgentCore TRACE #{trace_count}: Full trace data: {trace_data}"
+                        )
 
-                    # Only yield traces that have meaningful content
-                    # Skip empty progress traces that have no reasoning, collaborator calls, or responses
-                    has_content = (
-                        "reasoning" in trace_data
-                        or "calling_collaborator" in trace_data
-                        or "collaborator_response" in trace_data
-                        or "tool_calls" in trace_data
-                    )
+                        # Only yield traces that have meaningful content
+                        # Skip empty progress traces that have no reasoning, collaborator calls, or responses
+                        has_content = (
+                            "reasoning" in trace_data
+                            or "calling_collaborator" in trace_data
+                            or "collaborator_response" in trace_data
+                            or "tool_calls" in trace_data
+                        )
 
-                    if has_content:
-                        yield {
-                            "type": "trace",
-                            "data": trace_data,
-                            "session_id": session_id,
-                        }
+                        if has_content:
+                            yield {
+                                "type": "trace",
+                                "data": trace_data,
+                                "session_id": session_id,
+                            }
 
-            logger.info(f"Stream completed: {chunk_count} chunks, {trace_count} traces")
+                logger.info(f"Stream completed: {chunk_count} chunks, {trace_count} traces")
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code', '')
+                error_message = str(e)
+                logger.error(f"Error during stream processing: {error_code} - {error_message}")
+                # Send error event to client
+                yield {
+                    "type": "error",
+                    "error": f"Stream error: {error_code}",
+                    "session_id": session_id,
+                }
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error during stream processing: {e}")
+                yield {
+                    "type": "error",
+                    "error": f"Unexpected error: {str(e)}",
+                    "session_id": session_id,
+                }
+                raise
